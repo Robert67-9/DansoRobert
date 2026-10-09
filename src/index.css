@@ -1,0 +1,88 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  html {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+    scroll-behavior: smooth;
+  }
+
+  code, pre, .font-mono {
+    font-family: 'JetBrains Mono', monospace;
+  }
+}
+
+@media print {
+  @page {
+    margin: 14mm;
+  }
+
+  body {
+    background: white !important;
+    color: black !important;
+    margin: 0 !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  body * {
+    visibility: hidden !important;
+  }
+
+  #resume,
+  #resume * {
+    visibility: visible !important;
+  }
+
+  #resume {
+    position: absolute !important;
+    inset: 0 auto auto 0 !important;
+    width: 100% !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: 0 !important;
+    background: white !important;
+    color: black !important;
+  }
+
+  #resume * {
+    color: black !important;
+    background-color: transparent !important;
+    border-color: #d4d4d8 !important;
+  }
+
+  #resume > div {
+    width: 100% !important;
+    max-width: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+  }
+
+  #resume .bg-white {
+    border: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+  }
+
+  #resume a {
+    color: black !important;
+    text-decoration: none !important;
+  }
+
+  #resume h1,
+  #resume h2,
+  #resume h3 {
+    break-after: avoid;
+  }
+
+  #resume img,
+  #resume li,
+  #resume .grid > div {
+    break-inside: avoid;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+}
