@@ -4,10 +4,11 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import fsPromises from 'fs/promises';
-import { randomBytes, randomUUID, timingSafeEqual } from 'crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import dotenv from 'dotenv';
 import { GoogleGenAI } from '@google/genai';
 import type { WorkGalleryImage, WorkProject } from './src/types';
+import { WORK_GALLERY_BUCKET, getSupabaseAdmin, isSupabaseConfigured } from './lib/supabase';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -20,8 +21,12 @@ const workGalleryDirectory = path.resolve(__dirname, 'storage', 'work-gallery');
 const workGalleryMetadataPath = path.resolve(__dirname, 'storage', 'work-gallery.json');
 const OWNER_SESSION_COOKIE = 'danso_owner_session';
 const OWNER_SESSION_DURATION_MS = 12 * 60 * 60 * 1000;
+// Stateless owner sessions: HMAC-signed tokens verifiable on any serverless instance.
+// Falls back to the in-process Map only for local dev without OWNER_PASSCODE changes.
 const ownerSessions = new Map<string, number>();
 const ownerLoginAttempts = new Map<string, { count: number; resetAt: number }>();
+const supabaseAdmin = () => getSupabaseAdmin();
+const legacyUploadsBasePath = process.env.LEGACY_UPLOADS_BASE_PATH || '/uploads/work-gallery/';
 
 // Body parser
 app.use(express.json({ limit: '80mb' }));
@@ -36,11 +41,21 @@ const getErrorMessage = (error: unknown): string => {
   return 'Unknown error.';
 };
 
+const isWorkGalleryImageUrl = (imageUrl: string): boolean => {
+  if (imageUrl.startsWith('/uploads/work-gallery/')) return true;
+  try {
+    const parsed = new URL(imageUrl);
+    return parsed.pathname.includes('/storage/v1/object/public/work-gallery/');
+  } catch {
+    return false;
+  }
+};
+
 const isWorkGalleryImage = (image: unknown): image is WorkGalleryImage =>
   isRecord(image)
   && typeof image.id === 'string'
   && typeof image.imageUrl === 'string'
-  && image.imageUrl.startsWith('/uploads/work-gallery/');
+  && isWorkGalleryImageUrl(image.imageUrl);
 
 const isWorkProject = (project: unknown): project is WorkProject => {
   if (!isRecord(project)) return false;
@@ -56,7 +71,7 @@ const isWorkProject = (project: unknown): project is WorkProject => {
     && images.every(isWorkGalleryImage);
 };
 
-const readWorkProjects = async (): Promise<WorkProject[]> => {
+const readWorkProjectsFromDisk = async (): Promise<WorkProject[]> => {
   try {
     const contents = await fsPromises.readFile(workGalleryMetadataPath, 'utf8');
     const entries: unknown = JSON.parse(contents);
@@ -92,20 +107,90 @@ const readWorkProjects = async (): Promise<WorkProject[]> => {
   }
 };
 
-const writeWorkProjects = async (projects: WorkProject[]) => {
+const readWorkProjects = async (): Promise<WorkProject[]> => {
+  const supabase = supabaseAdmin();
+  if (supabase) {
+    const { data: projects, error } = await supabase
+      .from('work_gallery_projects')
+      .select('id, title, caption, created_at')
+      .order('created_at', { ascending: false })
+      .limit(300);
+    if (error) throw error;
+    const projectIds = (projects ?? []).map((project) => project.id as string);
+    const imagesByProject = new Map<string, WorkGalleryImage[]>();
+    if (projectIds.length > 0) {
+      const { data: images, error: imagesError } = await supabase
+        .from('work_gallery_images')
+        .select('id, project_id, image_url, created_at')
+        .in('project_id', projectIds)
+        .order('created_at', { ascending: true });
+      if (imagesError) throw imagesError;
+      for (const image of images ?? []) {
+        const list = imagesByProject.get(image.project_id as string) ?? [];
+        list.push({ id: image.id as string, imageUrl: image.image_url as string });
+        imagesByProject.set(image.project_id as string, list);
+      }
+    }
+    return (projects ?? []).map((project) => ({
+      id: project.id as string,
+      title: project.title as string,
+      caption: (project.caption as string) ?? '',
+      images: imagesByProject.get(project.id as string) ?? [],
+      createdAt: project.created_at as string,
+    }));
+  }
+    return readWorkProjectsFromDisk();
+  };
+
+  const writeWorkProjects = async (projects: WorkProject[]) => {
   await fsPromises.mkdir(path.dirname(workGalleryMetadataPath), { recursive: true });
   const temporaryPath = `${workGalleryMetadataPath}.${randomUUID()}.tmp`;
   await fsPromises.writeFile(temporaryPath, JSON.stringify(projects, null, 2), 'utf8');
   await fsPromises.rename(temporaryPath, workGalleryMetadataPath);
 };
 
-const getOwnerSession = (req: express.Request) => {
+const signOwnerSession = (expiresAt: number): string | null => {
+  const secret = process.env.OWNER_PASSCODE;
+  if (!secret) return null;
+  const payload = `owner:${expiresAt}`;
+  const signature = createHmac('sha256', secret).update(payload).digest('hex');
+  return Buffer.from(`${payload}.${signature}`).toString('base64url');
+};
+
+const verifyOwnerSessionToken = (token: string): boolean => {
+  try {
+    const decoded = Buffer.from(token, 'base64url').toString('utf8');
+    const [payload, signature] = decoded.split('.');
+    if (!payload || !signature) return false;
+    const [, expiresAtRaw] = payload.split(':');
+    const expiresAt = Number(expiresAtRaw);
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) return false;
+    const secret = process.env.OWNER_PASSCODE;
+    if (!secret) return false;
+    const expected = createHmac('sha256', secret).update(payload).digest('hex');
+    const candidate = Buffer.from(signature);
+    const expectedBuffer = Buffer.from(expected);
+    return candidate.length === expectedBuffer.length && timingSafeEqual(candidate, expectedBuffer);
+  } catch {
+    return false;
+  }
+};
+
+const getOwnerSessionToken = (req: express.Request): string | null => {
   const cookie = req.headers.cookie
     ?.split(';')
     .map((part) => part.trim())
     .find((part) => part.startsWith(`${OWNER_SESSION_COOKIE}=`));
   const token = cookie?.slice(OWNER_SESSION_COOKIE.length + 1);
+  return token || null;
+};
+
+const getOwnerSession = (req: express.Request) => {
+  const token = getOwnerSessionToken(req);
   if (!token) return false;
+  // Stateless HMAC session: works across Vercel serverless instances.
+  if (verifyOwnerSessionToken(token)) return true;
+  // Legacy in-process fallback for local dev sessions issued before restart-less flows.
   const expiresAt = ownerSessions.get(token);
   if (!expiresAt || expiresAt <= Date.now()) {
     ownerSessions.delete(token);
@@ -281,8 +366,12 @@ app.post('/api/owner/login', (req, res) => {
   }
 
   ownerLoginAttempts.delete(ip);
-  const token = randomBytes(32).toString('hex');
-  ownerSessions.set(token, now + OWNER_SESSION_DURATION_MS);
+  const expiresAt = now + OWNER_SESSION_DURATION_MS;
+  const token = signOwnerSession(expiresAt) ?? randomUUID();
+  if (!signOwnerSession(expiresAt)) {
+    // Local fallback when signing secret checks change mid-session.
+    ownerSessions.set(token, expiresAt);
+  }
   res.setHeader(
     'Set-Cookie',
     `${OWNER_SESSION_COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${OWNER_SESSION_DURATION_MS / 1000}${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`,
@@ -291,11 +380,7 @@ app.post('/api/owner/login', (req, res) => {
 });
 
 app.post('/api/owner/logout', (req, res) => {
-  const cookie = req.headers.cookie
-    ?.split(';')
-    .map((part) => part.trim())
-    .find((part) => part.startsWith(`${OWNER_SESSION_COOKIE}=`));
-  const token = cookie?.slice(OWNER_SESSION_COOKIE.length + 1);
+  const token = getOwnerSessionToken(req);
   if (token) ownerSessions.delete(token);
   res.setHeader('Set-Cookie', `${OWNER_SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${process.env.NODE_ENV === 'production' ? '; Secure' : ''}`);
   return res.json({ success: true });
@@ -322,6 +407,65 @@ app.post('/api/work-gallery', requireOwner, async (req, res) => {
     }
 
     const { title, caption } = input;
+    const supabase = supabaseAdmin();
+
+    if (supabase) {
+      const { count } = await supabase
+        .from('work_gallery_projects')
+        .select('id', { count: 'exact', head: true });
+      if ((count ?? 0) >= 300) return res.status(409).json({ error: 'The work gallery has reached its 300-project limit.' });
+
+      const { data: projectRow, error: projectError } = await supabase
+        .from('work_gallery_projects')
+        .insert({ title, caption })
+        .select('id, title, caption, created_at')
+        .single();
+      if (projectError || !projectRow) throw projectError ?? new Error('Could not create the work project.');
+
+      const projectImages: WorkGalleryImage[] = [];
+      const uploadedPaths: string[] = [];
+      try {
+        for (const image of imageFiles) {
+          const imageId = randomUUID();
+          const extension = image.mimeType === 'image/jpeg' ? 'jpg' : image.mimeType.slice('image/'.length);
+          const storagePath = `${projectRow.id as string}/${imageId}.${extension}`;
+          const { error: uploadError } = await supabase.storage
+            .from(WORK_GALLERY_BUCKET)
+            .upload(storagePath, image.data, { contentType: image.mimeType, upsert: false });
+          if (uploadError) throw uploadError;
+          uploadedPaths.push(storagePath);
+          const { data: publicUrl } = supabase.storage.from(WORK_GALLERY_BUCKET).getPublicUrl(storagePath);
+          const { data: imageRow, error: imageError } = await supabase
+            .from('work_gallery_images')
+            .insert({
+              id: imageId,
+              project_id: projectRow.id as string,
+              image_url: publicUrl.publicUrl,
+              storage_path: storagePath,
+              mime_type: image.mimeType,
+            })
+            .select('id, image_url')
+            .single();
+          if (imageError || !imageRow) throw imageError ?? new Error('Could not save the project image.');
+          projectImages.push({ id: imageRow.id as string, imageUrl: imageRow.image_url as string });
+        }
+
+        const project: WorkProject = {
+          id: projectRow.id as string,
+          title: projectRow.title as string,
+          caption: (projectRow.caption as string) ?? '',
+          images: projectImages,
+          createdAt: projectRow.created_at as string,
+        };
+        const projects = await readWorkProjects();
+        return res.status(201).json({ project, projects });
+      } catch (error) {
+        await supabase.storage.from(WORK_GALLERY_BUCKET).remove(uploadedPaths).catch(() => undefined);
+        await supabase.from('work_gallery_projects').delete().eq('id', projectRow.id as string);
+        throw error;
+      }
+    }
+
     const projects = await readWorkProjects();
     if (projects.length >= 300) return res.status(409).json({ error: 'The work gallery has reached its 300-project limit.' });
 
@@ -365,6 +509,29 @@ app.post('/api/work-gallery', requireOwner, async (req, res) => {
 
 app.delete('/api/work-gallery/:id', requireOwner, async (req, res) => {
   try {
+    const supabase = supabaseAdmin();
+    if (supabase) {
+      const { data: project, error: projectError } = await supabase
+        .from('work_gallery_projects')
+        .select('id')
+        .eq('id', req.params.id)
+        .maybeSingle();
+      if (projectError) throw projectError;
+      if (!project) return res.status(404).json({ error: 'Work project not found.' });
+
+      const { data: images } = await supabase
+        .from('work_gallery_images')
+        .select('storage_path')
+        .eq('project_id', req.params.id);
+      const storagePaths = (images ?? []).map((image) => image.storage_path as string).filter(Boolean);
+      if (storagePaths.length > 0) {
+        await supabase.storage.from(WORK_GALLERY_BUCKET).remove(storagePaths).catch(() => undefined);
+      }
+      const { error: deleteError } = await supabase.from('work_gallery_projects').delete().eq('id', req.params.id);
+      if (deleteError) throw deleteError;
+      return res.json({ projects: await readWorkProjects() });
+    }
+
     const projects = await readWorkProjects();
     const project = projects.find((item) => item.id === req.params.id);
     if (!project) return res.status(404).json({ error: 'Work project not found.' });
@@ -385,8 +552,33 @@ app.delete('/api/work-gallery/:id', requireOwner, async (req, res) => {
   }
 });
 
+const toInquiryMessage = (row: Record<string, unknown>): InquiryMessage => ({
+  id: String(row.id),
+  name: String(row.name),
+  email: String(row.email),
+  subject: String(row.subject ?? 'New Portfolio Inquiry'),
+  inquiryType: String(row.inquiry_type ?? 'General Inquiry'),
+  budget: row.budget === null || row.budget === undefined ? undefined : String(row.budget),
+  message: String(row.message),
+  timestamp: String(row.timestamp),
+  read: Boolean(row.read),
+  status: (row.status === 'read' || row.status === 'pending' ? row.status : 'delivered') as InquiryMessage['status'],
+});
+
+const readMessagesFromSupabase = async (): Promise<InquiryMessage[]> => {
+  const supabase = supabaseAdmin();
+  if (!supabase) return [...messages];
+  const { data, error } = await supabase
+    .from('inquiries')
+    .select('id, name, email, subject, inquiry_type, budget, message, timestamp, read, status')
+    .order('timestamp', { ascending: false })
+    .limit(500);
+  if (error) throw error;
+  return (data ?? []).map((row) => toInquiryMessage(row as Record<string, unknown>));
+};
+
 // Contact endpoint
-app.post('/api/contact', (req, res) => {
+app.post('/api/contact', async (req, res) => {
   try {
     const { name, email, subject, inquiryType, budget, message } = req.body;
 
@@ -394,14 +586,47 @@ app.post('/api/contact', (req, res) => {
       return res.status(400).json({ error: 'Name, email, and message are required.' });
     }
 
+    const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailPattern.test(String(email).trim())) {
+      return res.status(400).json({ error: 'Enter a valid email address.' });
+    }
+
+    const payload = {
+      name: String(name).trim().slice(0, 120),
+      email: String(email).trim().slice(0, 160),
+      subject: subject ? String(subject).trim().slice(0, 200) : 'New Portfolio Inquiry',
+      inquiry_type: inquiryType ? String(inquiryType).slice(0, 120) : 'General Inquiry',
+      budget: budget ? String(budget).slice(0, 120) : 'Flexible',
+      message: String(message).trim().slice(0, 5000),
+    };
+
+    const supabase = supabaseAdmin();
+    if (supabase) {
+      const { data, error } = await supabase
+        .from('inquiries')
+        .insert(payload)
+        .select('id, name, email, subject, inquiry_type, budget, message, timestamp, read, status')
+        .single();
+      if (error || !data) throw error ?? new Error('Could not save the inquiry.');
+      const inquiry = toInquiryMessage(data as Record<string, unknown>);
+      console.log(`[NOTIFICATION DISPATCH] Alert sent to dansorobert360@gmail.com from ${inquiry.name} <${inquiry.email}>`);
+      const allMessages = await readMessagesFromSupabase();
+      return res.status(201).json({
+        success: true,
+        message: 'Inquiry received and notification dispatched to dansorobert360@gmail.com! Danso will respond within 24-48 hours.',
+        inquiry,
+        unreadCount: allMessages.filter((item) => !item.read).length,
+      });
+    }
+
     const newMessage: InquiryMessage = {
       id: `msg-${Date.now()}`,
-      name: String(name).trim(),
-      email: String(email).trim(),
-      subject: subject ? String(subject).trim() : 'New Portfolio Inquiry',
-      inquiryType: inquiryType || 'General Inquiry',
-      budget: budget || 'Flexible',
-      message: String(message).trim(),
+      name: payload.name,
+      email: payload.email,
+      subject: payload.subject,
+      inquiryType: payload.inquiry_type,
+      budget: payload.budget,
+      message: payload.message,
       timestamp: new Date().toISOString(),
       read: false,
       status: 'delivered'
@@ -424,49 +649,121 @@ app.post('/api/contact', (req, res) => {
 });
 
 // Messages list for recruiter inbox / notification badge
-app.get('/api/messages', requireOwner, (req, res) => {
-  const unreadCount = messages.filter(m => !m.read).length;
-  res.json({
-    messages,
-    unreadCount,
-    totalCount: messages.length
-  });
+app.get('/api/messages', requireOwner, async (req, res) => {
+  try {
+    const allMessages = await readMessagesFromSupabase();
+    const unreadCount = allMessages.filter(m => !m.read).length;
+    res.json({
+      messages: allMessages,
+      unreadCount,
+      totalCount: allMessages.length
+    });
+  } catch (error) {
+    return sendServerError(res, 'Could not load messages.', error);
+  }
 });
 
 // Mark message as read
-app.patch('/api/messages/:id/read', requireOwner, (req, res) => {
-  const { id } = req.params;
-  const msg = messages.find(m => m.id === id);
-  if (!msg) {
-    return res.status(404).json({ error: `Message ${id} was not found.` });
+app.patch('/api/messages/:id/read', requireOwner, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const supabase = supabaseAdmin();
+    if (supabase) {
+      const { data, error } = await supabase
+        .from('inquiries')
+        .update({ read: true, status: 'read' })
+        .eq('id', id)
+        .select('id');
+      if (error) throw error;
+      if (!data || data.length === 0) {
+        return res.status(404).json({ error: `Message ${id} was not found.` });
+      }
+      const allMessages = await readMessagesFromSupabase();
+      return res.json({ success: true, unreadCount: allMessages.filter((m) => !m.read).length, messages: allMessages });
+    }
+    const msg = messages.find(m => m.id === id);
+    if (!msg) {
+      return res.status(404).json({ error: `Message ${id} was not found.` });
+    }
+    msg.read = true;
+    msg.status = 'read';
+    const unreadCount = messages.filter(m => !m.read).length;
+    return res.json({ success: true, unreadCount, messages });
+  } catch (error) {
+    return sendServerError(res, 'Could not update the message.', error);
   }
-  msg.read = true;
-  msg.status = 'read';
-  const unreadCount = messages.filter(m => !m.read).length;
-  return res.json({ success: true, unreadCount, messages });
 });
 
 // Mark all as read
-app.post('/api/messages/mark-all-read', requireOwner, (req, res) => {
-  messages.forEach(m => {
-    m.read = true;
-    m.status = 'read';
-  });
-  res.json({ success: true, unreadCount: 0, messages });
+app.post('/api/messages/mark-all-read', requireOwner, async (req, res) => {
+  try {
+    const supabase = supabaseAdmin();
+    if (supabase) {
+      const { error } = await supabase
+        .from('inquiries')
+        .update({ read: true, status: 'read' })
+        .eq('read', false);
+      if (error) throw error;
+      const allMessages = await readMessagesFromSupabase();
+      return res.json({ success: true, unreadCount: 0, messages: allMessages });
+    }
+    messages.forEach(m => {
+      m.read = true;
+      m.status = 'read';
+    });
+    res.json({ success: true, unreadCount: 0, messages });
+  } catch (error) {
+    return sendServerError(res, 'Could not update messages.', error);
+  }
 });
 
 // Delete message
-app.delete('/api/messages/:id', requireOwner, (req, res) => {
-  const { id } = req.params;
-  messages = messages.filter(m => m.id !== id);
-  const unreadCount = messages.filter(m => !m.read).length;
-  res.json({ success: true, unreadCount, messages });
+app.delete('/api/messages/:id', requireOwner, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const supabase = supabaseAdmin();
+    if (supabase) {
+      const { data, error } = await supabase.from('inquiries').delete().eq('id', id).select('id');
+      if (error) throw error;
+      if (!data || data.length === 0) {
+        return res.status(404).json({ error: `Message ${id} was not found.` });
+      }
+      const allMessages = await readMessagesFromSupabase();
+      return res.json({ success: true, unreadCount: allMessages.filter((m) => !m.read).length, messages: allMessages });
+    }
+    messages = messages.filter(m => m.id !== id);
+    const unreadCount = messages.filter(m => !m.read).length;
+    res.json({ success: true, unreadCount, messages });
+  } catch (error) {
+    return sendServerError(res, 'Could not delete the message.', error);
+  }
 });
 
 // Reset demo messages
-app.post('/api/messages/reset', requireOwner, (req, res) => {
-  messages = [...initialMessages];
-  res.json({ success: true, unreadCount: messages.filter(m => !m.read).length, messages });
+app.post('/api/messages/reset', requireOwner, async (req, res) => {
+  try {
+    const supabase = supabaseAdmin();
+    if (supabase) {
+      await supabase.from('inquiries').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      const { error } = await supabase.from('inquiries').insert(
+        initialMessages.map((item) => ({
+          name: item.name,
+          email: item.email,
+          subject: item.subject,
+          inquiry_type: item.inquiryType,
+          budget: item.budget ?? null,
+          message: item.message,
+        })),
+      );
+      if (error) throw error;
+      const allMessages = await readMessagesFromSupabase();
+      return res.json({ success: true, unreadCount: allMessages.filter((m) => !m.read).length, messages: allMessages });
+    }
+    messages = [...initialMessages];
+    res.json({ success: true, unreadCount: messages.filter(m => !m.read).length, messages });
+  } catch (error) {
+    return sendServerError(res, 'Could not reset messages.', error);
+  }
 });
 
 // Resume / credentials unlock ($0.50 micro-payment)
@@ -715,11 +1012,17 @@ app.post('/api/ai/generate-image', async (req, res) => {
   }
 });
 
-// Vite & Static file serving setup
+// Serve legacy locally-stored gallery images (local dev only). In production,
+// images live in Supabase Storage and imageUrl points at public Supabase URLs.
+app.use('/uploads/work-gallery', express.static(workGalleryDirectory, { maxAge: '1d', immutable: true }));
+
 async function startServer() {
   const isProduction = process.env.NODE_ENV === 'production';
-  await fsPromises.mkdir(workGalleryDirectory, { recursive: true });
-  app.use('/uploads/work-gallery', express.static(workGalleryDirectory, { maxAge: '1d', immutable: true }));
+  try {
+    await fsPromises.mkdir(workGalleryDirectory, { recursive: true });
+  } catch {
+    // Serverless filesystems (Vercel) are read-only; Supabase Storage is the source of truth there.
+  }
 
   if (!isProduction) {
     // In dev mode, mount Vite as middleware
@@ -740,12 +1043,19 @@ async function startServer() {
     }
   }
 
+  if (process.env.VERCEL) return;
+
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`Portfolio Server running at http://localhost:${PORT}`);
     console.log(`Serving Danso Robert Opoku's portfolio`);
+    console.log(`Supabase backend: ${isSupabaseConfigured() ? 'connected' : 'not configured (using local fallbacks)'}`);
   });
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start server:', err);
-});
+if (!process.env.VERCEL) {
+  startServer().catch((err) => {
+    console.error('Failed to start server:', err);
+  });
+}
+
+export default app;
