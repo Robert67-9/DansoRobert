@@ -1,5 +1,4 @@
 import express from 'express';
-import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
@@ -13,7 +12,12 @@ import { WORK_GALLERY_BUCKET, getSupabaseAdmin, isSupabaseConfigured } from './l
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-dotenv.config({ path: [path.resolve(__dirname, '.env.local'), path.resolve(__dirname, '.env')] });
+try {
+  dotenv.config({ path: path.resolve(__dirname, '.env.local') });
+  dotenv.config({ path: path.resolve(__dirname, '.env') });
+} catch {
+  // Env files are optional (Vercel injects env vars directly).
+}
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
@@ -1025,7 +1029,10 @@ async function startServer() {
   }
 
   if (!isProduction) {
-    // In dev mode, mount Vite as middleware
+    // In dev mode, mount Vite as middleware. Imported dynamically so the
+    // production / serverless bundle never includes the Vite dev server
+    // (it pulls native binaries that crash Vercel function boot).
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
