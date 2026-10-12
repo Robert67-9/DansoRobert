@@ -26,7 +26,6 @@ const OWNER_SESSION_DURATION_MS = 12 * 60 * 60 * 1000;
 const ownerSessions = new Map<string, number>();
 const ownerLoginAttempts = new Map<string, { count: number; resetAt: number }>();
 const supabaseAdmin = () => getSupabaseAdmin();
-const legacyUploadsBasePath = process.env.LEGACY_UPLOADS_BASE_PATH || '/uploads/work-gallery/';
 
 // Body parser
 app.use(express.json({ limit: '80mb' }));
@@ -352,7 +351,7 @@ app.post('/api/owner/login', (req, res) => {
     });
   }
 
-  const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode : '';
+  const passcode = typeof req.body?.passcode === 'string' ? req.body.passcode.trim() : '';
   const candidate = Buffer.from(passcode);
   const expected = Buffer.from(configuredPasscode);
   const isValid = candidate.length === expected.length && timingSafeEqual(candidate, expected);
@@ -767,7 +766,8 @@ app.post('/api/messages/reset', requireOwner, async (req, res) => {
 });
 
 // Resume / credentials unlock ($0.50 micro-payment)
-app.post('/api/payments/resume-unlock', requireOwner, (req, res) => {
+// Public endpoint: visitors pay to unlock; owners bypass on the client via handleOpenPaywall.
+app.post('/api/payments/resume-unlock', (req, res) => {
   const { name, cardNumber, cardExpiry, cardCvc, momoNetwork, momoNumber, paymentMethod } = req.body ?? {};
 
   const digitsOnly = (value: unknown) => (typeof value === 'string' ? value.replace(/\D/g, '') : '');

@@ -7,3 +7,6 @@ storage/
 *.log
 .env*
 !.env.example
+.vscode/
+supabase/.temp/
+login-test.mjs
