@@ -1029,16 +1029,16 @@ async function startServer() {
   }
 
   if (!isProduction) {
-    // In dev mode, mount Vite as middleware. Imported dynamically so the
-    // production / serverless bundle never includes the Vite dev server
-    // (it pulls native binaries that crash Vercel function boot).
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-    console.log('Vite middleware mounted in development mode');
+    // Dev-only: mount Vite middleware via an indirection the serverless
+    // bundler cannot statically trace. A plain `import('vite')` here still
+    // gets bundled into the Vercel API function (native binaries +
+    // @vitejs/devtools), which crashes cold start with
+    // FUNCTION_INVOCATION_FAILED. The indirection below keeps Vite local.
+    const mountModule = './lib/' + 'vite-middleware.js';
+    const { mountViteMiddleware } = await import(/* @vite-ignore */ mountModule) as {
+      mountViteMiddleware: (app: express.Express) => Promise<void>;
+    };
+    await mountViteMiddleware(app);
   } else {
     // In production, serve dist folder
     const distPath = path.resolve(__dirname, 'dist');
