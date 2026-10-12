@@ -1,6 +1,6 @@
 import express from 'express';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
 import fs from 'fs';
 import fsPromises from 'fs/promises';
 import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
@@ -1028,19 +1028,11 @@ async function startServer() {
     // Serverless filesystems (Vercel) are read-only; Supabase Storage is the source of truth there.
   }
 
-  if (!isProduction) {
-    // Dev-only: mount Vite middleware via an indirection the serverless
-    // bundler cannot statically trace. A plain `import('vite')` here still
-    // gets bundled into the Vercel API function (native binaries +
-    // @vitejs/devtools), which crashes cold start with
-    // FUNCTION_INVOCATION_FAILED. The indirection below keeps Vite local.
-    const mountModule = './lib/' + 'vite-middleware.js';
-    const { mountViteMiddleware } = await import(/* @vite-ignore */ mountModule) as {
-      mountViteMiddleware: (app: express.Express) => Promise<void>;
-    };
-    await mountViteMiddleware(app);
-  } else {
-    // In production, serve dist folder
+  if (isProduction) {
+    // In production, serve dist folder.
+    // NOTE: the Vite dev server is deliberately never imported in this module.
+    // Local dev serves the frontend through dev-server.ts (`npm run dev`) so the
+    // serverless bundler cannot trace Vite into the Vercel API function.
     const distPath = path.resolve(__dirname, 'dist');
     if (fs.existsSync(distPath)) {
       app.use(express.static(distPath));
@@ -1059,7 +1051,10 @@ async function startServer() {
   });
 }
 
-if (!process.env.VERCEL) {
+// Auto-start only when this file is the direct entrypoint (`tsx server.ts`).
+// Importers (dev-server.ts, api/index.ts) manage listening/bundling themselves.
+const entryFile = process.argv[1] ? pathToFileURL(path.resolve(process.argv[1])).href : null;
+if (entryFile === import.meta.url && !process.env.VERCEL) {
   startServer().catch((err) => {
     console.error('Failed to start server:', err);
   });
