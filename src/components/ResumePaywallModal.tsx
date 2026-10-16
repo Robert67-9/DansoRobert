@@ -11,12 +11,15 @@ import {
   Sparkles,
   FileText
 } from 'lucide-react';
+import type { PricingInfo } from '../hooks/usePricing';
+import { FALLBACK_PRICING, formatUsd } from '../hooks/usePricing';
 
 interface ResumePaywallModalProps {
   isOpen: boolean;
   onClose: () => void;
   onPaymentSuccess: () => void;
   isOwner: boolean;
+  pricing?: PricingInfo;
 }
 
 export const ResumePaywallModal: React.FC<ResumePaywallModalProps> = ({
@@ -24,6 +27,7 @@ export const ResumePaywallModal: React.FC<ResumePaywallModalProps> = ({
   onClose,
   onPaymentSuccess,
   isOwner,
+  pricing = FALLBACK_PRICING,
 }) => {
   const [paymentMethod, setPaymentMethod] = useState<'card' | 'momo'>('card');
   const [cardNumber, setCardNumber] = useState('');
@@ -121,8 +125,18 @@ export const ResumePaywallModal: React.FC<ResumePaywallModalProps> = ({
               All-Access Credential Fee
             </span>
             <span className="text-2xl font-extrabold text-zinc-950 dark:text-zinc-50 font-mono">
-              $0.50 <span className="text-xs text-zinc-500 font-normal">USD</span>
+              {formatUsd(pricing.finalPriceUsd)} <span className="text-xs text-zinc-500 font-normal">USD</span>
             </span>
+            {pricing.hasDiscount && (
+              <span className="flex items-center gap-2 mt-1">
+                <span className="text-xs text-zinc-400 line-through font-mono">
+                  {formatUsd(pricing.basePriceUsd)}
+                </span>
+                <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold bg-emerald-500 text-white">
+                  {pricing.discountPercent}% OFF
+                </span>
+              </span>
+            )}
           </div>
 
           <div className="text-right">
@@ -300,12 +314,12 @@ export const ResumePaywallModal: React.FC<ResumePaywallModalProps> = ({
               {isProcessing ? (
                 <>
                   <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"></div>
-                  <span>Processing $0.50 Secure Payment...</span>
+                  <span>Processing {formatUsd(pricing.finalPriceUsd)} Secure Payment...</span>
                 </>
               ) : (
                 <>
                   <ShieldCheck className="w-4 h-4 text-emerald-500" />
-                  <span>Pay $0.50 & Download Resume Now</span>
+                  <span>Pay {formatUsd(pricing.finalPriceUsd)} & Download Resume Now</span>
                 </>
               )}
             </button>

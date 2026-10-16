@@ -16,7 +16,7 @@ His multifaceted background spans UI/UX prototyping in Figma and Adobe XD, data 
   email: 'dansorobert360@gmail.com',
   phone: '+233 591 784 205',
   website: '', // Site URL omitted as requested
-  avatarUrl: '/avatar.jpg',
+  avatarUrl: '/avatar.png',
   statusText: 'Available for UI/UX Design, IT Consulting & Drone Operations',
   availableForHire: true,
   socials: {

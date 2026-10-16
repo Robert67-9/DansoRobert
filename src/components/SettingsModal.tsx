@@ -19,11 +19,16 @@ import {
   Image as ImageIcon,
   Sliders,
   Palette,
-  LogOut
+  LogOut,
+  Percent,
+  Tag,
+  Trash2
 } from 'lucide-react';
 import { ProfileData } from '../types';
 import { defaultProfile } from '../data/portfolioData';
 import { processPassportPhoto, BackdropTheme } from '../utils/backgroundReplacer';
+import { formatUsd } from '../hooks/usePricing';
+import { MAX_DISCOUNT_PERCENT, useAdminDiscount } from '../hooks/useAdminDiscount';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -34,12 +39,14 @@ interface SettingsModalProps {
   toggleTheme: () => void;
   isOwner: boolean;
   onSetOwner: (authenticated: boolean) => void;
+  /** Called after the owner changes the resume discount so the portfolio price refreshes. */
+  onPricingChanged?: () => void;
 }
 
 const PRESET_AVATARS = [
   {
     name: 'Danso Passport (Default)',
-    url: '/avatar.jpg',
+    url: '/avatar.png',
   },
   {
     name: 'Executive Studio',
@@ -64,10 +71,52 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   toggleTheme,
   isOwner,
   onSetOwner,
+  onPricingChanged,
 }) => {
   // Passcode gate state
   const [passcodeInput, setPasscodeInput] = useState('');
   const [passcodeError, setPasscodeError] = useState<string | null>(null);
+
+  // Resume-unlock discount manager (owner only)
+  const {
+    pricing: adminPricing,
+    isLoading: isLoadingDiscount,
+    isSaving: isSavingDiscount,
+    error: discountError,
+    saveDiscount,
+    clearDiscount,
+  } = useAdminDiscount({ enabled: isOpen && isOwner });
+  const [discountInput, setDiscountInput] = useState('0');
+  const [discountEnabled, setDiscountEnabled] = useState(false);
+  const [discountSaved, setDiscountSaved] = useState(false);
+
+  // Sync the editor with the pricing the server reports for this owner session.
+  useEffect(() => {
+    setDiscountInput(String(adminPricing.discountPercent));
+    setDiscountEnabled(adminPricing.hasDiscount);
+  }, [adminPricing.discountPercent, adminPricing.hasDiscount]);
+
+  const handleApplyDiscount = async () => {
+    const parsed = Number(discountInput);
+    if (!Number.isFinite(parsed) || parsed < 0 || parsed > MAX_DISCOUNT_PERCENT) {
+      return;
+    }
+    const next = await saveDiscount(parsed, discountEnabled && parsed > 0);
+    if (next) {
+      onPricingChanged?.();
+      setDiscountSaved(true);
+      setTimeout(() => setDiscountSaved(false), 2000);
+    }
+  };
+
+  const handleClearDiscount = async () => {
+    const next = await clearDiscount();
+    if (next) {
+      setDiscountInput('0');
+      setDiscountEnabled(false);
+      onPricingChanged?.();
+    }
+  };
 
   const [avatarUrl, setAvatarUrl] = useState(profile.avatarUrl);
   const [rawUploadedImage, setRawUploadedImage] = useState<string | null>(null);
@@ -534,6 +583,93 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               >
                 <span>Manage Cookies</span>
               </button>
+            </div>
+
+            {/* SECTION 6: RESUME UNLOCK DISCOUNT MANAGER */}
+            <div className="p-4 rounded-2xl bg-zinc-50 dark:bg-zinc-800/40 border border-zinc-200 dark:border-zinc-700/60 space-y-4">
+              <div className="flex items-center justify-between">
+                <h4 className="text-xs font-bold text-zinc-900 dark:text-zinc-100 flex items-center gap-1.5">
+                  <Percent className="w-3.5 h-3.5 text-emerald-500" />
+                  <span>Resume Unlock Discount</span>
+                </h4>
+                {adminPricing.hasDiscount && (
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-mono font-bold bg-emerald-500 text-white">
+                    {adminPricing.discountPercent}% OFF
+                  </span>
+                )}
+              </div>
+
+              <div className="flex items-baseline gap-2">
+                <span className="text-2xl font-extrabold text-zinc-950 dark:text-zinc-50 font-mono">
+                  {formatUsd(adminPricing.finalPriceUsd)}
+                </span>
+                {adminPricing.hasDiscount && (
+                  <span className="text-xs text-zinc-400 line-through font-mono">
+                    {formatUsd(adminPricing.basePriceUsd)}
+                  </span>
+                )}
+                <span className="text-[11px] text-zinc-500">charged at checkout</span>
+              </div>
+
+              <div className="flex flex-col sm:flex-row sm:items-center gap-3">
+                <label className="flex items-center gap-2 text-xs font-medium text-zinc-700 dark:text-zinc-300">
+                  <input
+                    type="checkbox"
+                    checked={discountEnabled}
+                    onChange={(e) => setDiscountEnabled(e.target.checked)}
+                    className="w-4 h-4 rounded border-zinc-300 text-emerald-600 focus:ring-emerald-500"
+                  />
+                  <span>Active</span>
+                </label>
+
+                <div className="flex items-center gap-2 flex-1">
+                  <Tag className="w-3.5 h-3.5 text-zinc-400" />
+                  <input
+                    type="number"
+                    min={0}
+                    max={MAX_DISCOUNT_PERCENT}
+                    value={discountInput}
+                    onChange={(e) => setDiscountInput(e.target.value)}
+                    className="w-20 px-2.5 py-1.5 text-xs rounded-lg bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-700 text-zinc-900 dark:text-zinc-100 font-mono"
+                  />
+                  <span className="text-xs text-zinc-500">% off (0–{MAX_DISCOUNT_PERCENT})</span>
+                </div>
+              </div>
+
+              {discountError && (
+                <p className="text-[11px] text-red-500 flex items-center gap-1.5">
+                  <AlertCircle className="w-3.5 h-3.5" />
+                  {discountError}
+                </p>
+              )}
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleApplyDiscount}
+                  disabled={isLoadingDiscount || isSavingDiscount}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-semibold bg-emerald-600 text-white hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed shadow-xs"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  <span>{isSavingDiscount ? 'Applying…' : 'Apply Discount'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={handleClearDiscount}
+                  disabled={isLoadingDiscount || isSavingDiscount}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-medium bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-700 text-zinc-800 dark:text-zinc-200 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-50 disabled:cursor-not-allowed shadow-xs"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>Remove</span>
+                </button>
+                {discountSaved && (
+                  <span className="text-[11px] font-mono text-emerald-600 dark:text-emerald-400">✓ Saved</span>
+                )}
+              </div>
+
+              <p className="text-[11px] text-zinc-500">
+                The discount is stored server-side, so the price shown on the paywall, resume section, and checkout always match.
+              </p>
             </div>
 
           </div>

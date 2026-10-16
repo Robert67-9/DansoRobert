@@ -21,6 +21,7 @@ import { SettingsModal } from './components/SettingsModal';
 import { NotificationDrawer } from './components/NotificationDrawer';
 import { CookieConsentBanner } from './components/CookieConsentBanner';
 import { ResumePaywallModal } from './components/ResumePaywallModal';
+import { usePricing } from './hooks/usePricing';
 
 export default function App() {
   // Theme state
@@ -46,6 +47,9 @@ export default function App() {
 
   // Paywall modal visibility
   const [isPaywallOpen, setIsPaywallOpen] = useState(false);
+
+  // Resume-unlock pricing (admin discount applies to the price shown everywhere)
+  const { pricing, refreshPricing } = usePricing();
 
   // User Profile state (with localStorage persistence so avatar updates persist)
   const [profile, setProfile] = useState<ProfileData>(() => {
@@ -366,6 +370,7 @@ export default function App() {
         toggleTheme={toggleTheme}
         isOwner={isOwner}
         onSetOwner={handleSetOwner}
+        onPricingChanged={refreshPricing}
       />
 
       {/* Resume Paywall Modal ($0.50 Micro-Payment Gateway) */}
@@ -374,6 +379,7 @@ export default function App() {
         onClose={() => setIsPaywallOpen(false)}
         onPaymentSuccess={handlePaymentSuccess}
         isOwner={isOwner}
+        pricing={pricing}
       />
 
       {/* Inquiry Notifications Drawer */}

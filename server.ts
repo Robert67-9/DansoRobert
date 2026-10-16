@@ -23,6 +23,9 @@ const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const workGalleryDirectory = path.resolve(__dirname, 'storage', 'work-gallery');
 const workGalleryMetadataPath = path.resolve(__dirname, 'storage', 'work-gallery.json');
+const pricingMetadataPath = path.resolve(__dirname, 'storage', 'pricing.json');
+const RESUME_BASE_PRICE_USD = 0.5;
+const MAX_DISCOUNT_PERCENT = 90;
 const OWNER_SESSION_COOKIE = 'danso_owner_session';
 const OWNER_SESSION_DURATION_MS = 12 * 60 * 60 * 1000;
 // Stateless owner sessions: HMAC-signed tokens verifiable on any serverless instance.
@@ -150,6 +153,129 @@ const readWorkProjects = async (): Promise<WorkProject[]> => {
   const temporaryPath = `${workGalleryMetadataPath}.${randomUUID()}.tmp`;
   await fsPromises.writeFile(temporaryPath, JSON.stringify(projects, null, 2), 'utf8');
   await fsPromises.rename(temporaryPath, workGalleryMetadataPath);
+};
+
+// --- Resume unlock pricing / admin discount ---
+interface DiscountConfig {
+  discountPercent: number;
+  discountActive: boolean;
+  updatedAt: string;
+}
+
+const DEFAULT_DISCOUNT: DiscountConfig = {
+  discountPercent: 0,
+  discountActive: false,
+  updatedAt: new Date(0).toISOString(),
+};
+
+let cachedDiscount: DiscountConfig | null = null;
+
+const clampDiscountPercent = (value: unknown): number | null => {
+  const num = typeof value === 'string' ? Number(value) : value;
+  if (typeof num !== 'number' || !Number.isFinite(num)) return null;
+  const rounded = Math.round(num);
+  if (rounded < 0 || rounded > MAX_DISCOUNT_PERCENT) return null;
+  return rounded;
+};
+
+const readDiscountFromDisk = async (): Promise<DiscountConfig> => {
+  try {
+    const contents = await fsPromises.readFile(pricingMetadataPath, 'utf8');
+    const parsed: unknown = JSON.parse(contents);
+    if (!isRecord(parsed)) return { ...DEFAULT_DISCOUNT };
+    const percent = clampDiscountPercent(parsed.discountPercent);
+    return {
+      discountPercent: percent ?? 0,
+      discountActive: parsed.discountActive === true && (percent ?? 0) > 0,
+      updatedAt: typeof parsed.updatedAt === 'string' ? parsed.updatedAt : new Date(0).toISOString(),
+    };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { ...DEFAULT_DISCOUNT };
+    throw error;
+  }
+};
+
+const writeDiscountToDisk = async (config: DiscountConfig) => {
+  try {
+    await fsPromises.mkdir(path.dirname(pricingMetadataPath), { recursive: true });
+    const temporaryPath = `${pricingMetadataPath}.${randomUUID()}.tmp`;
+    await fsPromises.writeFile(temporaryPath, JSON.stringify(config, null, 2), 'utf8');
+    await fsPromises.rename(temporaryPath, pricingMetadataPath);
+  } catch {
+    // Serverless filesystems (Vercel) are read-only; keep the in-memory value.
+  }
+};
+
+const getDiscountConfig = async (): Promise<DiscountConfig> => {
+  if (cachedDiscount) return cachedDiscount;
+  // Prefer Supabase single-row table `site_pricing` when configured so the
+  // discount persists across serverless instances; fall back to disk/memory.
+  const supabase = supabaseAdmin();
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('site_pricing')
+        .select('discount_percent, discount_active, updated_at')
+        .eq('id', 'resume-unlock')
+        .maybeSingle();
+      if (!error && data) {
+        const percent = clampDiscountPercent(data.discount_percent as unknown) ?? 0;
+        cachedDiscount = {
+          discountPercent: percent,
+          discountActive: Boolean(data.discount_active) && percent > 0,
+          updatedAt: typeof data.updated_at === 'string' ? data.updated_at as string : new Date().toISOString(),
+        };
+        return cachedDiscount;
+      }
+    } catch {
+      // Table may not exist yet — fall through to disk.
+    }
+  }
+  cachedDiscount = await readDiscountFromDisk();
+  return cachedDiscount;
+};
+
+const saveDiscountConfig = async (percent: number, active: boolean): Promise<DiscountConfig> => {
+  const config: DiscountConfig = {
+    discountPercent: percent,
+    discountActive: active && percent > 0,
+    updatedAt: new Date().toISOString(),
+  };
+  cachedDiscount = config;
+  const supabase = supabaseAdmin();
+  if (supabase) {
+    try {
+      const { error } = await supabase.from('site_pricing').upsert(
+        {
+          id: 'resume-unlock',
+          discount_percent: config.discountPercent,
+          discount_active: config.discountActive,
+          updated_at: config.updatedAt,
+        },
+        { onConflict: 'id' },
+      );
+      if (error) throw error;
+    } catch (error) {
+      console.warn('Supabase pricing save failed, using local fallback:', getErrorMessage(error));
+    }
+  }
+  await writeDiscountToDisk(config);
+  return config;
+};
+
+const toPricingResponse = (config: DiscountConfig) => {
+  const effectivePercent = config.discountActive ? config.discountPercent : 0;
+  const finalPriceUsd = Math.max(
+    0,
+    Math.round(RESUME_BASE_PRICE_USD * (1 - effectivePercent / 100) * 100) / 100,
+  );
+  return {
+    basePriceUsd: RESUME_BASE_PRICE_USD,
+    discountPercent: effectivePercent,
+    discountActive: effectivePercent > 0,
+    finalPriceUsd,
+    hasDiscount: effectivePercent > 0,
+  };
 };
 
 const signOwnerSession = (expiresAt: number): string | null => {
@@ -769,9 +895,51 @@ app.post('/api/messages/reset', requireOwner, async (req, res) => {
   }
 });
 
-// Resume / credentials unlock ($0.50 micro-payment)
+// Resume / credentials unlock pricing (public) + admin discount controls
+app.get('/api/pricing', async (_req, res) => {
+  try {
+    const config = await getDiscountConfig();
+    return res.json(toPricingResponse(config));
+  } catch (error) {
+    return sendServerError(res, 'Could not load pricing.', error);
+  }
+});
+
+app.get('/api/admin/pricing', requireOwner, async (_req, res) => {
+  try {
+    const config = await getDiscountConfig();
+    return res.json({ ...toPricingResponse(config), updatedAt: config.updatedAt });
+  } catch (error) {
+    return sendServerError(res, 'Could not load pricing.', error);
+  }
+});
+
+app.put('/api/admin/pricing', requireOwner, async (req, res) => {
+  try {
+    const percent = clampDiscountPercent(req.body?.discountPercent);
+    if (percent === null) {
+      return res.status(400).json({ error: `Enter a discount between 0 and ${MAX_DISCOUNT_PERCENT} percent.` });
+    }
+    const active = req.body?.discountActive !== false && percent > 0;
+    const config = await saveDiscountConfig(percent, active);
+    return res.json({ success: true, ...toPricingResponse(config), updatedAt: config.updatedAt });
+  } catch (error) {
+    return sendServerError(res, 'Could not save the discount.', error);
+  }
+});
+
+app.delete('/api/admin/pricing', requireOwner, async (_req, res) => {
+  try {
+    const config = await saveDiscountConfig(0, false);
+    return res.json({ success: true, ...toPricingResponse(config), updatedAt: config.updatedAt });
+  } catch (error) {
+    return sendServerError(res, 'Could not remove the discount.', error);
+  }
+});
+
+// Resume / credentials unlock ($0.50 micro-payment, less any active admin discount)
 // Public endpoint: visitors pay to unlock; owners bypass on the client via handleOpenPaywall.
-app.post('/api/payments/resume-unlock', (req, res) => {
+app.post('/api/payments/resume-unlock', async (req, res) => {
   const { name, cardNumber, cardExpiry, cardCvc, momoNetwork, momoNumber, paymentMethod } = req.body ?? {};
 
   const digitsOnly = (value: unknown) => (typeof value === 'string' ? value.replace(/\D/g, '') : '');
@@ -814,8 +982,21 @@ app.post('/api/payments/resume-unlock', (req, res) => {
 
   const receiptId = `TXN-${randomUUID().slice(0, 8).toUpperCase()}`;
   const payer = method === 'momo' ? String(momoNumber).trim() : String(name).trim();
-  console.log(`[PAYMENT] $0.50 resume unlock authorized via ${method} for ${payer} (${receiptId})`);
-  return res.json({ success: true, receiptId, amountUsd: 0.5, paymentMethod: method });
+  let pricing = toPricingResponse({ ...DEFAULT_DISCOUNT });
+  try {
+    pricing = toPricingResponse(await getDiscountConfig());
+  } catch (error) {
+    console.warn('Could not load the active discount; charging the base price:', getErrorMessage(error));
+  }
+  console.log(`[PAYMENT] $${pricing.finalPriceUsd.toFixed(2)} resume unlock authorized via ${method} for ${payer} (${receiptId})`);
+  return res.json({
+    success: true,
+    receiptId,
+    amountUsd: pricing.finalPriceUsd,
+    basePriceUsd: pricing.basePriceUsd,
+    discountPercent: pricing.discountPercent,
+    paymentMethod: method,
+  });
 });
 
 // AI Feature 1: Image Understanding & Analysis using gemini-3.1-pro-preview
